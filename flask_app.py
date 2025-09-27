@@ -3,8 +3,7 @@ import yt_dlp
 import random
 import time
 import re
-import requests
-from urllib.parse import parse_qs, urlparse
+import os
 
 app = Flask(__name__)
 
@@ -16,7 +15,7 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ]
 
-# Rate limiting storage (in-memory for Railway)
+# Rate limiting storage
 request_times = {}
 
 def is_rate_limited(ip, max_requests=5, window_seconds=60):
@@ -39,7 +38,6 @@ def extract_video_id(url):
     patterns = [
         r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&?/]+)',
         r'youtube\.com/watch\?.*v=([^&]+)',
-        r'youtube\.com/v/([^?]+)'
     ]
     
     for pattern in patterns:
@@ -69,12 +67,10 @@ def get_ydl_options(attempt):
             'retries': 2,
             'fragment_retries': 2,
             'skip_unavailable_fragments': True,
-            'ratelimit': 256000,  # Conservative rate limit
+            'ratelimit': 256000,
             'socket_timeout': 30,
-            'extractor_args': {'youtube': {'player_skip': ['configs']}},
         }
     else:
-        # Second attempt with different approach
         return {
             'quiet': True,
             'skip_download': True,
@@ -88,11 +84,117 @@ def get_ydl_options(attempt):
             'socket_timeout': 20,
         }
 
+def categorize_formats(formats):
+    """Categorize formats into multiple types with detailed information"""
+    
+    # Progressive formats (video + audio combined)
+    progressive_formats = []
+    # Adaptive video formats (video only)
+    adaptive_video_formats = []
+    # Adaptive audio formats (audio only)
+    adaptive_audio_formats = []
+    
+    seen_combinations = set()
+    
+    for f in formats:
+        if not f.get('url'):
+            continue
+            
+        # Skip problematic formats
+        ext = f.get('ext', '')
+        protocol = f.get('protocol', '')
+        if any(x in ext or x in protocol for x in ['m3u8', 'mpd', 'dash']):
+            continue
+            
+        # Get basic format info
+        format_id = f.get('format_id', '')
+        filesize = f.get('filesize', 0)
+        quality = f.get('quality', 0)
+        
+        # Progressive format (video + audio together)
+        if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+            height = f.get('height', 0)
+            if height >= 144:
+                format_key = f"{height}p-{ext}-progressive"
+                if format_key not in seen_combinations:
+                    seen_combinations.add(format_key)
+                    progressive_formats.append({
+                        "type": "progressive",
+                        "quality": f"{height}p",
+                        "height": height,
+                        "width": f.get('width'),
+                        "format": ext,
+                        "format_note": f.get('format_note', ''),
+                        "filesize": filesize,
+                        "filesize_mb": round(filesize / (1024 * 1024), 2) if filesize else 0,
+                        "video_codec": f.get('vcodec', '').split('.')[0],
+                        "audio_codec": f.get('acodec', '').split('.')[0],
+                        "fps": f.get('fps'),
+                        "download_url": f.get('url'),
+                        "format_id": format_id
+                    })
+        
+        # Adaptive video (video only)
+        elif f.get('vcodec') != 'none' and f.get('acodec') == 'none':
+            height = f.get('height', 0)
+            if height >= 144:
+                format_key = f"{height}p-{ext}-adaptive-video"
+                if format_key not in seen_combinations:
+                    seen_combinations.add(format_key)
+                    adaptive_video_formats.append({
+                        "type": "adaptive_video",
+                        "quality": f"{height}p",
+                        "height": height,
+                        "width": f.get('width'),
+                        "format": ext,
+                        "format_note": f.get('format_note', ''),
+                        "filesize": filesize,
+                        "filesize_mb": round(filesize / (1024 * 1024), 2) if filesize else 0,
+                        "video_codec": f.get('vcodec', '').split('.')[0],
+                        "fps": f.get('fps'),
+                        "download_url": f.get('url'),
+                        "format_id": format_id
+                    })
+        
+        # Adaptive audio (audio only)
+        elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
+            audio_bitrate = f.get('abr', 0)
+            format_key = f"audio-{audio_bitrate}-{ext}"
+            if format_key not in seen_combinations:
+                seen_combinations.add(format_key)
+                adaptive_audio_formats.append({
+                    "type": "adaptive_audio",
+                    "format": ext,
+                    "audio_codec": f.get('acodec', '').split('.')[0],
+                    "bitrate": audio_bitrate,
+                    "bitrate_kbps": f"{audio_bitrate} kbps" if audio_bitrate else "Unknown",
+                    "sample_rate": f.get('asr'),
+                    "filesize": filesize,
+                    "filesize_mb": round(filesize / (1024 * 1024), 2) if filesize else 0,
+                    "download_url": f.get('url'),
+                    "format_id": format_id
+                })
+    
+    # Sort formats
+    progressive_formats.sort(key=lambda x: x.get('height', 0), reverse=True)
+    adaptive_video_formats.sort(key=lambda x: x.get('height', 0), reverse=True)
+    adaptive_audio_formats.sort(key=lambda x: x.get('bitrate', 0), reverse=True)
+    
+    return {
+        "progressive": progressive_formats[:15],  # Limit to top 15
+        "adaptive_video": adaptive_video_formats[:15],
+        "adaptive_audio": adaptive_audio_formats[:10]
+    }
+
 @app.route('/')
 def hello_world():
     return jsonify({
         "message": "YouTube Video Links API",
         "status": "active",
+        "endpoints": {
+            "get_video_links": "POST /api/get_video_links",
+            "health_check": "GET /api/health"
+        },
         "usage": "POST /api/get_video_links with JSON body: {'url': 'youtube_url'}"
     })
 
@@ -127,7 +229,7 @@ def get_video_links():
     clean_url = f"https://www.youtube.com/watch?v={video_id}"
 
     # Try extraction with retries
-    max_attempts = 2  # Limited attempts for Railway
+    max_attempts = 2
     info = None
     
     for attempt in range(1, max_attempts + 1):
@@ -145,7 +247,6 @@ def get_video_links():
         except yt_dlp.DownloadError as e:
             error_msg = str(e)
             if attempt == max_attempts:
-                # Final attempt failed
                 if "Sign in" in error_msg:
                     return jsonify({
                         "error": "YouTube authentication required",
@@ -164,7 +265,6 @@ def get_video_links():
                         "message": str(e),
                         "video_id": video_id
                     }), 500
-            # Continue to next attempt
             continue
             
         except Exception as e:
@@ -183,63 +283,42 @@ def get_video_links():
             "video_id": video_id
         }), 500
 
-    # Process formats efficiently
-    videos = []
-    audios = []
-    seen_formats = set()
+    # Categorize formats into multiple types
+    formats = categorize_formats(info.get('formats', []))
 
-    for f in info.get('formats', [])[:50]:  # Limit processing for efficiency
-        if not f.get('url'):
-            continue
-
-        # Skip problematic formats
-        ext = f.get('ext', '')
-        protocol = f.get('protocol', '')
-        if any(x in ext or x in protocol for x in ['m3u8', 'mpd', 'dash']):
-            continue
-
-        # Create format signature to avoid duplicates
-        format_sig = f"{f.get('height', 0)}-{f.get('vcodec', 'none')}-{f.get('acodec', 'none')}-{ext}"
-        if format_sig in seen_formats:
-            continue
-        seen_formats.add(format_sig)
-
-        # Video with audio
-        if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-            height = f.get('height', 0)
-            if height >= 144:  # Reasonable minimum
-                videos.append({
-                    "resolution": f"{height}p",
-                    "format": ext,
-                    "height": height,
-                    "filesize": f.get('filesize'),
-                    "download_url": f.get('url')
-                })
-
-        # Audio only
-        elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-            audios.append({
-                "format": ext,
-                "bitrate": f.get('abr'),
-                "download_url": f.get('url')
-            })
-
-    # Sort and limit results
-    videos.sort(key=lambda x: x.get('height', 0), reverse=True)
-    audios.sort(key=lambda x: x.get('bitrate', 0) or 0, reverse=True)
-    
-    # Limit number of results for efficiency
-    videos = videos[:10]
-    audios = audios[:5]
+    # Get thumbnails in different qualities
+    thumbnails = info.get('thumbnails', [])
+    thumbnail_dict = {}
+    if thumbnails:
+        for thumb in thumbnails:
+            quality = thumb.get('id', 'default')
+            thumbnail_dict[quality] = thumb.get('url')
+    else:
+        thumbnail_dict['default'] = info.get('thumbnail')
 
     response_data = {
-        "title": info.get('title', 'Unknown'),
-        "thumbnail": info.get('thumbnail'),
-        "duration": info.get('duration'),
-        "uploader": info.get('uploader'),
-        "video_id": video_id,
-        "videos": videos,
-        "audios": audios,
+        "video_info": {
+            "title": info.get('title', 'Unknown'),
+            "duration": info.get('duration'),
+            "duration_string": info.get('duration_string'),
+            "uploader": info.get('uploader'),
+            "uploader_id": info.get('uploader_id'),
+            "view_count": info.get('view_count'),
+            "like_count": info.get('like_count'),
+            "description": info.get('description', '')[:500] + '...' if info.get('description') and len(info.get('description', '')) > 500 else info.get('description', ''),
+            "upload_date": info.get('upload_date'),
+            "video_id": video_id,
+            "categories": info.get('categories', []),
+            "tags": info.get('tags', [])[:10]  # Limit tags
+        },
+        "thumbnails": thumbnail_dict,
+        "formats": formats,
+        "format_summary": {
+            "progressive_count": len(formats["progressive"]),
+            "adaptive_video_count": len(formats["adaptive_video"]),
+            "adaptive_audio_count": len(formats["adaptive_audio"]),
+            "total_formats": len(formats["progressive"]) + len(formats["adaptive_video"]) + len(formats["adaptive_audio"])
+        },
         "success": True
     }
 
@@ -251,7 +330,8 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": time.time(),
-        "service": "YouTube Video Links API"
+        "service": "YouTube Video Links API",
+        "rate_limited_ips": len(request_times)
     })
 
 @app.errorhandler(404)
@@ -268,15 +348,15 @@ def internal_error(error):
 
 # Clean up rate limiting data periodically
 def cleanup_old_requests():
-    """Clean old rate limiting data (basic implementation)"""
+    """Clean old rate limiting data"""
     now = time.time()
     global request_times
     for ip in list(request_times.keys()):
-        request_times[ip] = [t for t in request_times[ip] if now - t < 300]  # 5 minutes
+        request_times[ip] = [t for t in request_times[ip] if now - t < 300]
         if not request_times[ip]:
             del request_times[ip]
 
-# Simple cleanup on every 10th request
+# Cleanup every 10th request
 request_count = 0
 
 @app.before_request
@@ -288,5 +368,4 @@ def before_request():
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8000))
-    # Don't use debug mode in production
     app.run(host='0.0.0.0', port=port, debug=False)
