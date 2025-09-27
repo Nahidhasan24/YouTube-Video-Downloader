@@ -2,202 +2,291 @@ from flask import Flask, request, jsonify
 import yt_dlp
 import random
 import time
+import re
+import requests
+from urllib.parse import parse_qs, urlparse
 
 app = Flask(__name__)
 
-# List of user agents to rotate
+# Lightweight user agents for Railway
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ]
+
+# Rate limiting storage (in-memory for Railway)
+request_times = {}
+
+def is_rate_limited(ip, max_requests=5, window_seconds=60):
+    """Basic rate limiting for Railway"""
+    now = time.time()
+    if ip not in request_times:
+        request_times[ip] = []
+    
+    # Clean old requests
+    request_times[ip] = [t for t in request_times[ip] if now - t < window_seconds]
+    
+    if len(request_times[ip]) >= max_requests:
+        return True
+    
+    request_times[ip].append(now)
+    return False
+
+def extract_video_id(url):
+    """Extract video ID from various YouTube URL formats"""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&?/]+)',
+        r'youtube\.com/watch\?.*v=([^&]+)',
+        r'youtube\.com/v/([^?]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def get_ydl_options(attempt):
+    """Get optimized yt-dlp options for Railway"""
+    base_headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+    }
+    
+    if attempt == 1:
+        return {
+            'quiet': True,
+            'skip_download': True,
+            'no_warnings': True,
+            'http_headers': {**base_headers, 'User-Agent': random.choice(USER_AGENTS)},
+            'extract_flat': False,
+            'ignoreerrors': True,
+            'retries': 2,
+            'fragment_retries': 2,
+            'skip_unavailable_fragments': True,
+            'ratelimit': 256000,  # Conservative rate limit
+            'socket_timeout': 30,
+            'extractor_args': {'youtube': {'player_skip': ['configs']}},
+        }
+    else:
+        # Second attempt with different approach
+        return {
+            'quiet': True,
+            'skip_download': True,
+            'no_warnings': True,
+            'http_headers': {**base_headers, 'User-Agent': random.choice(USER_AGENTS)},
+            'ignoreerrors': True,
+            'extract_flat': 'in_playlist',
+            'youtube_include_dash_manifest': False,
+            'youtube_include_hls_manifest': False,
+            'retries': 1,
+            'socket_timeout': 20,
+        }
 
 @app.route('/')
 def hello_world():
-    return 'Hello from Flask!'
+    return jsonify({
+        "message": "YouTube Video Links API",
+        "status": "active",
+        "usage": "POST /api/get_video_links with JSON body: {'url': 'youtube_url'}"
+    })
 
 @app.route('/api/get_video_links', methods=['POST'])
 def get_video_links():
-    data = request.json
-    url = data.get('url')
+    # Get client IP for rate limiting
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    if isinstance(client_ip, str) and ',' in client_ip:
+        client_ip = client_ip.split(',')[0].strip()
+    
+    # Rate limiting check
+    if is_rate_limited(client_ip, max_requests=3, window_seconds=60):
+        return jsonify({
+            "error": "Rate limit exceeded",
+            "message": "Too many requests. Please try again in a minute."
+        }), 429
 
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON data"}), 400
+    
+    url = data.get('url', '').strip()
     if not url:
         return jsonify({"error": "You must provide a YouTube URL"}), 400
 
-    # Enhanced yt-dlp options to avoid detection
-    ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'no_warnings': False,
-        
-        # Headers configuration
-        'http_headers': {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-        },
-        
-        # Extractor options
-        'extract_flat': False,
-        'ignoreerrors': False,
-        'no_overwrites': True,
-        
-        # Retry configuration
-        'retries': 10,
-        'fragment_retries': 10,
-        'skip_unavailable_fragments': True,
-        'keep_fragments': False,
-        
-        # Rate limiting to appear more human-like
-        'ratelimit': 512000,  # 500 KB/s
-        'throttledratelimit': 512000,
-        
-        # YouTube specific options
-        'youtube_include_dash_manifest': False,
-        'youtube_include_hls_manifest': False,
-        
-        # Simulate human behavior
-        'sleep_interval': 2,
-        'max_sleep_interval': 5,
-        
-        # Format selection
-        'format': 'best[height<=1080]',  # Limit to 1080p to avoid suspicious behavior
-    }
+    # Validate YouTube URL
+    video_id = extract_video_id(url)
+    if not video_id:
+        return jsonify({"error": "Invalid YouTube URL"}), 400
 
-    try:
-        # Add small delay to simulate human behavior
-        time.sleep(random.uniform(1, 3))
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First try with standard extraction
-            try:
-                info = ydl.extract_info(url, download=False)
-            except Exception as e:
-                # If first attempt fails, try with different parameters
-                if "Sign in" in str(e) or "bot" in str(e).lower():
-                    # Retry with more conservative settings
-                    ydl_opts['ratelimit'] = 256000  # Slow down more
-                    ydl_opts['retries'] = 5
-                    ydl_opts['sleep_interval'] = 5
-                    
-                    # Try different user agent
-                    ydl_opts['http_headers']['User-Agent'] = random.choice(USER_AGENTS)
-                    
-                    time.sleep(random.uniform(3, 6))  # Longer delay
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl_retry:
-                        info = ydl_retry.extract_info(url, download=False)
+    # Construct proper YouTube URL
+    clean_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Try extraction with retries
+    max_attempts = 2  # Limited attempts for Railway
+    info = None
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ydl_opts = get_ydl_options(attempt)
+            
+            # Add delay between attempts
+            if attempt > 1:
+                time.sleep(random.uniform(2, 4))
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_url, download=False)
+                break
+                
+        except yt_dlp.DownloadError as e:
+            error_msg = str(e)
+            if attempt == max_attempts:
+                # Final attempt failed
+                if "Sign in" in error_msg:
+                    return jsonify({
+                        "error": "YouTube authentication required",
+                        "message": "This is a temporary restriction. Please try again later.",
+                        "video_id": video_id
+                    }), 503
+                elif "Failed to extract any player response" in error_msg:
+                    return jsonify({
+                        "error": "YouTube API change detected",
+                        "message": "Please try again later or use a different video.",
+                        "video_id": video_id
+                    }), 503
                 else:
-                    raise e
+                    return jsonify({
+                        "error": "Failed to extract video info",
+                        "message": str(e),
+                        "video_id": video_id
+                    }), 500
+            # Continue to next attempt
+            continue
+            
+        except Exception as e:
+            if attempt == max_attempts:
+                return jsonify({
+                    "error": "Extraction failed",
+                    "message": str(e),
+                    "video_id": video_id
+                }), 500
+            continue
 
-    except yt_dlp.DownloadError as e:
-        if "Sign in" in str(e):
-            return jsonify({
-                "error": "YouTube is requiring authentication. This is a temporary restriction. Please try again later or use a different network.",
-                "details": "Try again in a few hours or consider using cookies for authentication."
-            }), 503
-        else:
-            return jsonify({
-                "error": "Failed to extract video info", 
-                "details": str(e)
-            }), 500
-    except Exception as e:
+    if not info:
         return jsonify({
-            "error": "An unexpected error occurred",
-            "details": str(e)
+            "error": "Could not extract video information",
+            "message": "Please try again later.",
+            "video_id": video_id
         }), 500
 
-    # Process formats
+    # Process formats efficiently
     videos = []
     audios = []
+    seen_formats = set()
 
-    for f in info.get('formats', []):
+    for f in info.get('formats', [])[:50]:  # Limit processing for efficiency
         if not f.get('url'):
             continue
 
-        ext = f.get('ext')
-        protocol = f.get('protocol', '')
-
         # Skip problematic formats
-        if ext in ['m3u8', 'webm_dash', 'f4f', 'mpd'] or 'm3u8' in protocol:
+        ext = f.get('ext', '')
+        protocol = f.get('protocol', '')
+        if any(x in ext or x in protocol for x in ['m3u8', 'mpd', 'dash']):
             continue
 
-        # Skip formats with very low quality or suspicious properties
-        if f.get('quality') == -1 or f.get('preference') == -1000:
+        # Create format signature to avoid duplicates
+        format_sig = f"{f.get('height', 0)}-{f.get('vcodec', 'none')}-{f.get('acodec', 'none')}-{ext}"
+        if format_sig in seen_formats:
             continue
+        seen_formats.add(format_sig)
 
-        # Progressive video (video + audio)
+        # Video with audio
         if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-            # Filter out very low resolution videos
-            height = f.get('height')
-            if height and height >= 144:  # Minimum 144p
+            height = f.get('height', 0)
+            if height >= 144:  # Reasonable minimum
                 videos.append({
-                    "resolution": f.get('resolution') or f"{height}p",
+                    "resolution": f"{height}p",
                     "format": ext,
                     "height": height,
-                    "width": f.get('width'),
                     "filesize": f.get('filesize'),
                     "download_url": f.get('url')
                 })
 
-        # Audio-only
+        # Audio only
         elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
             audios.append({
                 "format": ext,
-                "abr": f.get('abr'),  # audio bitrate
-                "asr": f.get('asr'),  # audio sample rate
-                "filesize": f.get('filesize'),
+                "bitrate": f.get('abr'),
                 "download_url": f.get('url')
             })
 
-    # Sort videos by resolution (highest first)
+    # Sort and limit results
     videos.sort(key=lambda x: x.get('height', 0), reverse=True)
+    audios.sort(key=lambda x: x.get('bitrate', 0) or 0, reverse=True)
     
-    # Sort audios by bitrate (highest first)
-    audios.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
-
-    # Remove duplicates based on resolution and format
-    seen = set()
-    unique_videos = []
-    for video in videos:
-        key = (video.get('height'), video.get('format'))
-        if key not in seen:
-            seen.add(key)
-            unique_videos.append(video)
+    # Limit number of results for efficiency
+    videos = videos[:10]
+    audios = audios[:5]
 
     response_data = {
-        "title": info.get('title'),
+        "title": info.get('title', 'Unknown'),
         "thumbnail": info.get('thumbnail'),
         "duration": info.get('duration'),
         "uploader": info.get('uploader'),
-        "view_count": info.get('view_count'),
-        "videos": unique_videos,
+        "video_id": video_id,
+        "videos": videos,
         "audios": audios,
         "success": True
     }
 
     return jsonify(response_data)
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Railway"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time(),
+        "service": "YouTube Video Links API"
+    })
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({"error": "Method not allowed"}), 405
 
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
+# Clean up rate limiting data periodically
+def cleanup_old_requests():
+    """Clean old rate limiting data (basic implementation)"""
+    now = time.time()
+    global request_times
+    for ip in list(request_times.keys()):
+        request_times[ip] = [t for t in request_times[ip] if now - t < 300]  # 5 minutes
+        if not request_times[ip]:
+            del request_times[ip]
+
+# Simple cleanup on every 10th request
+request_count = 0
+
+@app.before_request
+def before_request():
+    global request_count
+    request_count += 1
+    if request_count % 10 == 0:
+        cleanup_old_requests()
+
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=8000)
+    port = int(os.environ.get('PORT', 8000))
+    # Don't use debug mode in production
+    app.run(host='0.0.0.0', port=port, debug=False)
