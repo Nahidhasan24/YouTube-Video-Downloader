@@ -3,7 +3,7 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# --- Simple Hello World ---
+# --- Hello World ---
 @app.route('/')
 def hello_world():
     return 'Hello from Flask!'
@@ -21,34 +21,42 @@ def get_video_links():
         'quiet': True,
         'skip_download': True,
         'noproxy': True,
-        'ignoreerrors': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": "Failed to extract video info. Check the URL or your network.", "details": str(e)}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to extract video info", "details": str(e)}), 500
 
-    formats = []
+    videos = []
+    audios = []
+
     for f in info.get('formats', []):
-        if f.get('url'):
-            formats.append({
-                "format_id": f.get('format_id'),
-                "ext": f.get('ext'),
+        if not f.get('url'):
+            continue
+
+        # Progressive video (video + audio)
+        if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+            videos.append({
                 "resolution": f.get('resolution') or f.get('height'),
-                "filesize_MB": round(f.get('filesize', 0) / (1024*1024), 2) if f.get('filesize') else None,
-                "fps": f.get('fps'),
-                "abr": f.get('abr'),
+                "format": f.get('ext'),
+                "download_url": f.get('url')
+            })
+
+        # Audio-only
+        elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
+            audios.append({
+                "format": f.get('ext'),
+                "abr": f.get('abr'),  # audio bitrate
                 "download_url": f.get('url')
             })
 
     return jsonify({
         "title": info.get('title'),
-        "uploader": info.get('uploader'),
-        "formats": formats
+        "thumbnail": info.get('thumbnail'),
+        "videos": videos,
+        "audios": audios
     })
 
 
