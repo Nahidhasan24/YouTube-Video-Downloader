@@ -3,12 +3,10 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# --- Hello World ---
 @app.route('/')
 def hello_world():
     return 'Hello from Flask!'
 
-# --- YouTube Downloader API ---
 @app.route('/api/get_video_links', methods=['POST'])
 def get_video_links():
     data = request.json
@@ -36,6 +34,12 @@ def get_video_links():
         if not f.get('url'):
             continue
 
+        ext = f.get('ext')
+
+        # Skip HLS or DASH streams
+        if ext in ['m3u8', 'webm_dash', 'f4m', 'mpd']:
+            continue
+
         # Progressive video (video + audio)
         if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
             videos.append({
@@ -48,7 +52,7 @@ def get_video_links():
         elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
             audios.append({
                 "format": f.get('ext'),
-                "abr": f.get('abr'),  # audio bitrate
+                "abr": f.get('abr'),
                 "download_url": f.get('url')
             })
 
